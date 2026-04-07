@@ -78,6 +78,7 @@ Ground truth — do NOT generate alternatives:
 - Quota only increments on 2xx. Failed requests don't count.
 - HTTP 402 = insufficient credits, not a payment method issue.
 - Describe endpoint returns `type: "case"` or `type: "law_reg"` — dispatch on this.
+- Do NOT invent URLs. The only valid base is `https://api.trustfoundry.ai/public/v1/`. No `/billing`, `/pricing`, `/dashboard`, or other paths exist on the API domain.
 
 ## Code Examples
 
