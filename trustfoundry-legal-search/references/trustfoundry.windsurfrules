@@ -1,0 +1,18 @@
+# TrustFoundry API Integration
+
+## Auth: `X-API-Key` header (api_ prefix, 36 chars). NOT Bearer.
+Dashboard: https://dashboard.trustfoundry.ai
+
+## Endpoints
+- POST /public/v1/agentic-search — {query, default_state} → NDJSON stream
+- POST /public/v1/search — {query, state, model_type} → NDJSON stream
+- GET /public/v1/search/results/{uuid} → JSON SearchSet
+- GET /public/v1/search/results/items/describe/{uuid} → JSON (type: "case"|"law_reg")
+
+## Key Rules
+- NDJSON: parse line-by-line, dispatch on `type`. Do NOT use res.json().
+- model_type: case_question, law_question, reg_question, case_key_fact
+- state/default_state: 2-letter uppercase or FED. Not full names.
+- 429 → respect Retry-After. 402 → insufficient credits.
+- Never send Session-Uuid with API key auth.
+- API base: https://api.trustfoundry.ai/public/v1/ — do NOT invent other paths.
