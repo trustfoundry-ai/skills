@@ -7,7 +7,7 @@ Agent-native integration files for the [TrustFoundry](https://trustfoundry.ai) l
 Works with **Claude Code**, **OpenAI Codex**, **GitHub Copilot**, and any [agentskills.io](https://agentskills.io)-compatible agent:
 
 ```bash
-npx skills add Trust-Foundry/skills
+npx skills add trustfoundry-ai/skills
 ```
 
 ## What's Included
@@ -27,11 +27,13 @@ Integration skill for the TrustFoundry legal research API. Provides:
 
 ```
 trustfoundry-legal-search/
-├── SKILL.md                        # Main skill (auth, endpoints, streaming, errors)
+├── SKILL.md                           # Main skill (auth, endpoints, streaming, errors)
 └── references/
-    ├── endpoints.md                # Detailed endpoint contracts and schemas
-    ├── examples.md                 # Full TypeScript and Python examples
-    └── cursor-windsurf.md          # IDE-specific rule files (.mdc, .windsurfrules)
+    ├── endpoints.md                   # Detailed endpoint contracts and schemas
+    ├── examples.md                    # Full TypeScript and Python examples
+    ├── cursor-windsurf.md             # IDE rule documentation
+    ├── trustfoundry.mdc               # Standalone Cursor rule (download directly)
+    └── trustfoundry.windsurfrules     # Standalone Windsurf rule (download directly)
 ```
 
 ## Manual Installation
