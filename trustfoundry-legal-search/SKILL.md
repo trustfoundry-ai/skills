@@ -52,18 +52,63 @@ Search endpoints return `application/x-ndjson`. Each line is a complete JSON obj
 | `error` | `{type, content: {message}}` | Error occurred |
 | `end` | `{type}` | Stream finished |
 
-## Error Handling
+## Rate Limiting & Quota Management
 
-MUST implement these handlers for stable integrations:
+MUST implement proper rate limit handling. Without it, the API will reject most requests with 429s.
+
+### Two types of 429 — distinguish by error message
+
+| Error body | Cause | `Retry-After` means | Action |
+|-----------|-------|---------------------|--------|
+| `{"error":"Rate limit exceeded"}` | Too many requests/minute | Seconds until rate limit window resets | Back off, then retry |
+| `{"error":"Quota exceeded"}` | Monthly/lifetime quota used up | Seconds until quota period resets | Stop calling this category until reset |
+
+### Response headers — check on EVERY response (including 2xx)
+
+| Header | Value | When present |
+|--------|-------|-------------|
+| `X-RateLimit-Limit` | Requests/minute allowed | Always |
+| `X-RateLimit-Remaining` | Requests left this minute | Always |
+| `X-RateLimit-Reset` | Unix timestamp when minute window resets | Always |
+| `X-Quota-Category` | Product category (e.g. `fast_citation_search`) | Metered endpoints |
+| `X-Quota-Limit` | Total quota for billing period | Metered endpoints |
+| `X-Quota-Remaining` | Remaining quota | Metered endpoints |
+| `X-Quota-Reset` | ISO 8601 timestamp when quota period resets | Metered endpoints |
+| `X-Quota-Warning` | `true` when usage >= 75% of quota | Metered endpoints |
+| `Retry-After` | Seconds to wait before retrying | 429 responses only |
+| `X-Request-Id` | Unique request ID for debugging | Always |
+
+### Required: Exponential backoff with Retry-After
+
+```
+on 429:
+  1. Read Retry-After header (seconds)
+  2. Wait AT LEAST that many seconds
+  3. Retry with exponential backoff: wait * 2^attempt (cap at 60s)
+  4. Max 3 retries, then surface the error
+
+on 2xx:
+  1. Check X-RateLimit-Remaining — if < 5, slow down request rate
+  2. Check X-Quota-Warning — if "true", alert user they're near quota limit
+  3. Check X-Quota-Remaining — if 0, stop making requests to this category
+```
+
+### Best practices for high-volume integrations
+
+- **Pre-check remaining capacity**: Read `X-RateLimit-Remaining` and `X-Quota-Remaining` from every response. Do NOT fire requests blindly.
+- **Pace requests**: If rate limit is 60/min, space requests ~1s apart. Bursting causes cascading 429s.
+- **Distinguish rate limit vs quota**: Rate limits reset every minute (retry soon). Quota resets at the billing period boundary (could be days — stop retrying).
+- **Log X-Request-Id on errors**: Include it when reporting issues to TrustFoundry support.
+- **Never retry 401/402**: These are auth/billing errors, not transient. Fix the root cause.
+
+### Error reference
 
 | Code | Condition | Response | Action |
 |------|-----------|----------|--------|
-| 429 | Rate limit exceeded | `{"error":"Rate limit exceeded"}` | Respect `Retry-After` header, back off |
-| 429 | Quota exceeded | `{"error":"Quota exceeded"}` | Wait for reset per `Retry-After` |
-| 402 | Insufficient credits | `{"error":"Insufficient credits","credits_required":N}` | Acquire credits or wait for quota reset |
+| 429 | Rate limit exceeded | `{"error":"Rate limit exceeded"}` | Read `Retry-After`, backoff, retry |
+| 429 | Quota exceeded | `{"error":"Quota exceeded"}` | Read `Retry-After`, stop until quota resets |
+| 402 | Insufficient credits (overage) | `{"error":"Insufficient credits","credits_required":N}` | Purchase credits or wait for quota reset |
 | 401 | Invalid/missing API key | `{"error":"invalid_token"}` | Check `X-API-Key` header |
-
-Response headers for monitoring: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `X-Quota-Limit`, `X-Quota-Remaining`, `X-Request-Id`.
 
 ## Hallucination Protection
 
@@ -85,51 +130,103 @@ Ground truth — do NOT generate alternatives:
 
 For complete TypeScript and Python examples with error handling, see [references/examples.md](references/examples.md).
 
-### Minimal TypeScript
+### Minimal TypeScript (with retry)
 
 ```typescript
-const res = await fetch("https://api.trustfoundry.ai/public/v1/agentic-search", {
-  method: "POST",
-  headers: { "X-API-Key": process.env.TRUSTFOUNDRY_API_KEY!, "Content-Type": "application/json" },
-  body: JSON.stringify({ query: "HIPAA violation penalties", default_state: "FED" }),
-});
+const API_KEY = process.env.TRUSTFOUNDRY_API_KEY!;
+const BASE = "https://api.trustfoundry.ai";
 
-if (res.status === 429) throw new Error(`Retry after ${res.headers.get("Retry-After")}s`);
-if (res.status === 402) throw new Error("Insufficient credits");
+async function searchWithRetry(query: string, state = "FED", maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(`${BASE}/public/v1/agentic-search`, {
+      method: "POST",
+      headers: { "X-API-Key": API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ query, default_state: state }),
+    });
 
-const reader = res.body!.getReader();
-const decoder = new TextDecoder();
-let buf = "";
-while (true) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  buf += decoder.decode(value, { stream: true });
-  const lines = buf.split("\n");
-  buf = lines.pop()!;
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    const evt = JSON.parse(line);
-    if (evt.type === "citations_ready") return evt.content.search_results;
-    if (evt.type === "error") throw new Error(evt.content?.message);
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.headers.get("Retry-After") ?? "10", 10);
+      const isQuota = (await res.json()).error === "Quota exceeded";
+      if (isQuota) throw new Error(`Quota exceeded. Resets in ${retryAfter}s`);
+      if (attempt === maxRetries) throw new Error("Rate limited after max retries");
+      const wait = retryAfter * Math.pow(2, attempt) * 1000;
+      console.warn(`Rate limited. Waiting ${wait / 1000}s (attempt ${attempt + 1})`);
+      await new Promise((r) => setTimeout(r, wait));
+      continue;
+    }
+    if (res.status === 402) throw new Error("Insufficient credits");
+    if (res.status === 401) throw new Error("Invalid API key");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    // Log remaining capacity
+    const rlRemaining = res.headers.get("X-RateLimit-Remaining");
+    const quotaRemaining = res.headers.get("X-Quota-Remaining");
+    if (rlRemaining && parseInt(rlRemaining) < 5) console.warn(`Rate limit low: ${rlRemaining} remaining`);
+    if (quotaRemaining) console.log(`Quota remaining: ${quotaRemaining}`);
+
+    // Parse NDJSON stream
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop()!;
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const evt = JSON.parse(line);
+        if (evt.type === "citations_ready") return evt.content.search_results;
+        if (evt.type === "error") throw new Error(evt.content?.message);
+      }
+    }
+    return [];
   }
 }
 ```
 
-### Minimal Python
+### Minimal Python (with retry)
 
 ```python
-import httpx, json, os
-with httpx.stream("POST", "https://api.trustfoundry.ai/public/v1/agentic-search",
-    headers={"X-API-Key": os.environ["TRUSTFOUNDRY_API_KEY"], "Content-Type": "application/json"},
-    json={"query": "HIPAA penalties", "default_state": "FED"},
-) as r:
-    if r.status_code == 429: raise Exception(f"Retry after {r.headers['retry-after']}s")
-    if r.status_code == 402: raise Exception("Insufficient credits")
-    r.raise_for_status()
-    for line in r.iter_lines():
-        if not line.strip(): continue
-        evt = json.loads(line)
-        if evt["type"] == "citations_ready":
-            for hit in evt["content"]["search_results"]:
-                print(f"{hit['header']}: {hit['excerpt'][:80]}")
+import httpx, json, os, time
+
+API_KEY = os.environ["TRUSTFOUNDRY_API_KEY"]
+BASE = "https://api.trustfoundry.ai"
+
+def search_with_retry(query: str, state: str = "FED", max_retries: int = 3):
+    for attempt in range(max_retries + 1):
+        with httpx.stream("POST", f"{BASE}/public/v1/agentic-search",
+            headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
+            json={"query": query, "default_state": state},
+        ) as r:
+            if r.status_code == 429:
+                retry_after = int(r.headers.get("retry-after", "10"))
+                error = r.json().get("error", "")
+                if error == "Quota exceeded":
+                    raise Exception(f"Quota exceeded. Resets in {retry_after}s")
+                if attempt == max_retries:
+                    raise Exception("Rate limited after max retries")
+                wait = retry_after * (2 ** attempt)
+                print(f"Rate limited. Waiting {wait}s (attempt {attempt + 1})")
+                time.sleep(wait)
+                continue
+            if r.status_code == 402:
+                raise Exception("Insufficient credits")
+            r.raise_for_status()
+
+            # Log remaining capacity
+            rl = r.headers.get("x-ratelimit-remaining")
+            quota = r.headers.get("x-quota-remaining")
+            if rl and int(rl) < 5: print(f"⚠ Rate limit low: {rl} remaining")
+            if quota: print(f"Quota remaining: {quota}")
+
+            for line in r.iter_lines():
+                if not line.strip(): continue
+                evt = json.loads(line)
+                if evt["type"] == "citations_ready":
+                    return evt["content"]["search_results"]
+                if evt["type"] == "error":
+                    raise Exception(evt.get("content", {}).get("message", "Stream error"))
+    return []
 ```
